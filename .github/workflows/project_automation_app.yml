@@ -1,0 +1,207 @@
+name: Project Automation using GitHub App
+
+on:
+  issues:
+    types: [edited]
+
+jobs:
+  update-dates:
+    runs-on: ubuntu-latest
+    steps:
+      # Step 1: Check out your repo (if needed)
+      - name: Check out
+        uses: actions/checkout@v3
+
+      # Step 2: Generate Installation Token
+      - name: Generate Installation Token
+        id: auth
+        run: |
+          # Install OpenSSL/JWT dependencies if needed
+          sudo apt-get update && sudo apt-get install -y openssl
+
+          # 1) Create a JWT. We'll do this inline with OpenSSL + a small script,
+          #    but you can also use a dedicated action or library (e.g., https://github.com/marketplace/actions/jwt-for-github-app).
+          # 2) Exchange JWT for an installation token.
+
+          # Times in epoch + 60 / 600 etc.
+          now=$(date +%s)
+          # JWT expiration must be within 10 minutes, e.g. now + 600
+          exp=$((now + 600))
+
+          header='{"alg":"RS256","typ":"JWT"}'
+          payload="$(jq -n --arg i "${{ secrets.APP_ID }}" --arg n "$now" --arg e "$exp" \
+            '{ iat: ($n|tonumber), exp: ($e|tonumber), iss: ($i|tonumber) }'
+          )"
+
+          # Base64url encode function
+          b64url() {
+            openssl base64 -e -A | tr '+/' '-_' | tr -d '='
+          }
+
+          header_b64=$(echo -n "$header" | b64url)
+          payload_b64=$(echo -n "$payload" | b64url)
+
+          data="${header_b64}.${payload_b64}"
+
+          # Sign with private key
+          signature=$(echo -n "$data" | openssl dgst -sha256 -sign <(echo "${{ secrets.APP_PRIVATE_KEY }}"))
+          signature_b64=$(echo -n "$signature" | b64url)
+
+          jwt="${data}.${signature_b64}"
+
+          echo "JWT=$jwt" >> $GITHUB_ENV
+
+          # Exchange the JWT for an installation token
+          install_id="${{ secrets.INSTALLATION_ID }}"
+          token_response=$(curl -s -X POST \
+            -H "Authorization: Bearer $jwt" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/app/installations/$install_id/access_tokens)
+
+          # Parse the token from JSON
+          access_token=$(echo "$token_response" | jq -r '.token')
+          echo "INSTALLATION_TOKEN=$access_token" >> $GITHUB_ENV
+
+      - name: Determine Project Item and Status
+        id: extract
+        run: |
+          # Parse the webhook payload to get owner/repo/issue_number.
+          EVENT_JSON="$(cat $GITHUB_EVENT_PATH)"
+          OWNER=$(echo "$EVENT_JSON" | jq -r '.repository.owner.login')
+          REPO=$(echo "$EVENT_JSON" | jq -r '.repository.name')
+          ISSUE_NUMBER=$(echo "$EVENT_JSON" | jq -r '.issue.number')
+
+          echo "Detected issue #$ISSUE_NUMBER in repo $OWNER/$REPO"
+
+          # 1) Query to find the Project item referencing this Issue
+          #    We'll fetch the itemId, projectId, plus field values for Status, Start/End date.
+
+          GRAPHQL_QUERY=$(jq -n --arg owner "$OWNER" --arg repo "$REPO" --arg number "$ISSUE_NUMBER" '
+            {
+              "query": "query($owner: String!, $repo: String!, $number: Int!) {\n  repository(name: $repo, owner: $owner) {\n    issue(number: $number) {\n      id\n      projectV2Items(first: 10) {\n        nodes {\n          id\n          project {\n            id\n            title\n          }\n          fieldValues(first: 20) {\n            nodes {\n              __typename\n              ... on ProjectV2ItemFieldSingleSelectValue {\n                name\n                field {\n                  ... on ProjectV2FieldCommon {\n                    name\n                    id\n                  }\n                }\n              }\n              ... on ProjectV2ItemFieldDateValue {\n                date\n                field {\n                  ... on ProjectV2FieldCommon {\n                    name\n                    id\n                  }\n                }\n              }\n            }\n          }\n        }\n      }\n    }\n  }\n}",
+              "variables": {
+                "owner": $owner,
+                "repo": $repo,
+                "number": ($number|tonumber)
+              }
+            }
+          ')
+
+          INSTALLATION_TOKEN="${{ env.INSTALLATION_TOKEN }}"
+          RESPONSE=$(curl -s -X POST \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $INSTALLATION_TOKEN" \
+            --data "$GRAPHQL_QUERY" \
+            https://api.github.com/graphql )
+
+          # 2) Parse out the item ID, project ID, and the fields we need
+          #    For simplicity, assume the first projectV2Item is the correct one
+          ITEM_ID=$(echo "$RESPONSE" | jq -r '.data.repository.issue.projectV2Items.nodes[0].id')
+          PROJECT_ID=$(echo "$RESPONSE" | jq -r '.data.repository.issue.projectV2Items.nodes[0].project.id')
+
+          echo "ITEM_ID=$ITEM_ID" >> $GITHUB_OUTPUT
+          echo "PROJECT_ID=$PROJECT_ID" >> $GITHUB_OUTPUT
+
+          # 3) Identify the field IDs for "Status", "Start Date", "End Date".
+          #    This code finds them by field name. In your actual usage,
+          #    you might store them in secrets or separate config, but here's how you
+          #    could dynamically match them:
+
+          FIELD_VALUES=$(echo "$RESPONSE" | jq '.data.repository.issue.projectV2Items.nodes[0].fieldValues.nodes')
+
+          STATUS_FIELD_ID=$(echo "$FIELD_VALUES" | jq -r '.[] | select(.field.name=="Status") | .field.id')
+          START_DATE_FIELD_ID=$(echo "$FIELD_VALUES" | jq -r '.[] | select(.field.name=="Start Date") | .field.id')
+          END_DATE_FIELD_ID=$(echo "$FIELD_VALUES" | jq -r '.[] | select(.field.name=="End Date") | .field.id')
+
+          echo "STATUS_FIELD_ID=$STATUS_FIELD_ID" >> $GITHUB_OUTPUT
+          echo "START_DATE_FIELD_ID=$START_DATE_FIELD_ID" >> $GITHUB_OUTPUT
+          echo "END_DATE_FIELD_ID=$END_DATE_FIELD_ID" >> $GITHUB_OUTPUT
+
+          # 4) Identify current status value
+          CURRENT_STATUS=$(echo "$FIELD_VALUES" | jq -r '.[] | select(.field.name=="Status") | .name')
+          echo "CURRENT_STATUS=$CURRENT_STATUS" >> $GITHUB_OUTPUT
+
+          echo "Discovered current status: $CURRENT_STATUS"
+          
+          # If you want to check 'changes' in $GITHUB_EVENT_PATH to see old vs. new
+          # status, you'd parse .changes field. However, for new Projects v2,
+          # that data is often not there. We'll rely on the GraphQL query for the new status.
+        
+      - name: Decide if Start or End Date needs updated
+        # Use the outputs from the 'extract' step
+        run: |
+          INSTALLATION_TOKEN="${{ env.INSTALLATION_TOKEN }}"
+
+          # Gather all the needed data from step outputs
+          PROJECT_ID="${{ steps.extract.outputs.PROJECT_ID }}"
+          ITEM_ID="${{ steps.extract.outputs.ITEM_ID }}"
+          STATUS_FIELD_ID="${{ steps.extract.outputs.STATUS_FIELD_ID }}"
+          START_DATE_FIELD_ID="${{ steps.extract.outputs.START_DATE_FIELD_ID }}"
+          END_DATE_FIELD_ID="${{ steps.extract.outputs.END_DATE_FIELD_ID }}"
+          CURRENT_STATUS="${{ steps.extract.outputs.CURRENT_STATUS }}"
+
+          echo "Project ID: $PROJECT_ID"
+          echo "Item ID: $ITEM_ID"
+          echo "Status Field ID: $STATUS_FIELD_ID"
+          echo "Start Date Field ID: $START_DATE_FIELD_ID"
+          echo "End Date Field ID: $END_DATE_FIELD_ID"
+          echo "Current Status: $CURRENT_STATUS"
+
+          if [ "$CURRENT_STATUS" = "In Progress" ]; then
+            echo "We should set the Start Date"
+            TODAY=$(date +%Y-%m-%d)
+
+            MUTATION_JSON=$(jq -n \
+              --arg projectId "$PROJECT_ID" \
+              --arg itemId "$ITEM_ID" \
+              --arg fieldId "$START_DATE_FIELD_ID" \
+              --arg dateVal "$TODAY" \
+              '{
+                 "query": "mutation($input: UpdateProjectV2ItemFieldValueInput!) { updateProjectV2ItemFieldValue(input: $input) { projectV2Item { id } } }",
+                 "variables": {
+                   "input": {
+                     "projectId": $projectId,
+                     "itemId": $itemId,
+                     "fieldId": $fieldId,
+                     "value": { "date": $dateVal }
+                   }
+                 }
+               }'
+            )
+
+            curl -s -X POST \
+              -H "Authorization: Bearer $INSTALLATION_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "$MUTATION_JSON" \
+              https://api.github.com/graphql
+
+          elif [ "$CURRENT_STATUS" = "Done" ]; then
+            echo "We should set the End Date"
+            TODAY=$(date +%Y-%m-%d)
+
+            MUTATION_JSON=$(jq -n \
+              --arg projectId "$PROJECT_ID" \
+              --arg itemId "$ITEM_ID" \
+              --arg fieldId "$END_DATE_FIELD_ID" \
+              --arg dateVal "$TODAY" \
+              '{
+                 "query": "mutation($input: UpdateProjectV2ItemFieldValueInput!) { updateProjectV2ItemFieldValue(input: $input) { projectV2Item { id } } }",
+                 "variables": {
+                   "input": {
+                     "projectId": $projectId,
+                     "itemId": $itemId,
+                     "fieldId": $fieldId,
+                     "value": { "date": $dateVal }
+                   }
+                 }
+               }'
+            )
+
+            curl -s -X POST \
+              -H "Authorization: Bearer $INSTALLATION_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "$MUTATION_JSON" \
+              https://api.github.com/graphql
+          else
+            echo "No date fields to set for status '$CURRENT_STATUS'"
+          fi
