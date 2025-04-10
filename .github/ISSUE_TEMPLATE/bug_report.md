@@ -8,7 +8,6 @@ assignees: RJT-tVFX, zachEastin
 ---
 ## Software (please complete the following information):
  - OS: [e.g. iOS]
- - Browser [e.g. chrome, safari]
  - TrueTERRAIN Version [e.g. 5.0.1 BETA]
  - Blender Version [e.g. 4.4.2]
 
